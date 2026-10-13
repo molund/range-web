@@ -28,7 +28,7 @@ GitHub Actions (e2e.yml)                OpenShift
 ### 1. Build the e2e image (tools)
 
 ```bash
-oc process -f openshift/e2e.bc.yaml -p SOURCE_REPOSITORY_URL=https://github.com/bcgov/range-web -p SOURCE_REPOSITORY_REF=dev | oc apply -f - -n 3187b2-tools
+oc process -f openshift/builds/e2e.yaml -p SOURCE_REPOSITORY_URL=https://github.com/bcgov/range-web -p SOURCE_REPOSITORY_REF=dev | oc apply -f - -n 3187b2-tools
 oc start-build range-web-e2e -n 3187b2-tools
 ```
 

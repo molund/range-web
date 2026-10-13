@@ -1,246 +1,72 @@
-[![img](https://img.shields.io/badge/Lifecycle-Maturing-007EC6)](https://github.com/bcgov/repomountie/blob/master/doc/lifecycle-badges.md)
-[![E2E on OpenShift](https://github.com/bcgov/range-web/actions/workflows/e2e.yml/badge.svg)](https://github.com/bcgov/range-web/actions/workflows/e2e.yml)
+# Playwright on OpenShift: reference fork of bcgov/range-web
 
-# About My Range Application (MyRangeBC) for Web
+## Why this fork exists
 
-The Range Mobile Pathfinder project is developing a suite of applications to support the sustainable management of cattle range on crown lands in British Columbia. [Learn more about the Range Program](https://www.for.gov.bc.ca/hra/)
+I was searching the [bcgov](https://github.com/bcgov) organization for teams that run
+Playwright end-to-end tests successfully on OpenShift. [bcgov/range-web](https://github.com/bcgov/range-web)
+(MyRangeBC) has a clean, working pattern, and I plan to reuse it for
+[bcgov/bcparks.ca](https://github.com/bcgov/bcparks.ca).
 
-The goal is to move important crown land management documents from paper to digital, and to make this information accessible in the field through disconnected mobile devices. This also supports a new and consistent process for Range staff across the province to support decision making processes.
+On GitHub Actions runners, bcparks.ca's Playwright tests get rate-limited by the BC Gov
+network edge partway through each run. Workarounds didn't solve it, and neither did moving
+to the bcgov static-IP larger runners. Running the tests as a Job inside OpenShift is one
+of the alternatives I'm looking at.
 
-An Agile Scrum team developed the Alpha product to test basic fuctions and was done March 31, 2018. Future releases by the Kamloops Range team at Kamloops Innovation Centre will lead towards an application that can be used by staff and public range use agreement holders, on multiple platforms.
+This fork is a **reference copy**. It isn't a contribution back to range-web, and nothing here
+is meant to be merged upstream. I removed the MyRangeBC application (React app, API/web
+deployments, BCGov pipeline). Only the files the e2e pattern depends on are left.
 
-For the Alpha Release, the web application documented here allows Range Branch Staff to view Range Use Plans that have been created in the iOS application. Soon, Range Officers will also be able to create and maintain records on web, but the offline abilities remain an iOS only feature for the time being. It also enables users to assign staff to a set of agreements they are responsible for managing.
+Thank you to the range-web team for doing the hard work in the open.
 
-### Related MyRangeBc Documentation
-
-- [MyRangeBC iOS application Github Repository](https://github.com/bcgov/range-ios)
-- [MyRangeBC Web application Github Repository](https://github.com/bcgov/range-web)
-- [MyRangeBC API Github Repository](https://github.com/bcgov/range-api)
-- Our current Sprint Backlog is visible on GitHub Issues, see each repo for what is going on.
-- [See the database Schema on Schema-Spy](http://schema-spy-range-myra-dev.pathfinder.gov.bc.ca/)
-
-## Folder Structure
+## The pattern in one picture
 
 ```
-root/
-  .eslintrc           // Displaying Lint Output in the Editor
-  LICENSE
-  README.md
-  package.json
-  semantic.json       // Semantic UI build settings for gulp
-  coverage/           // Test coverage
-  openshift/
-  public/             // Images, index.html etc...
-  semantic/           // Semantic UI custum styling definitions and overrides
-  src/
-    actionCreators/   // Network related Redux actions
-    actions/          // Redux actions
-    components/       // React components
-    constants/        // Variables, strings, etc...
-    reducers/         // Redux reducers
-    semantic/         // Minified Semantic UI
-    styles/           // All the Sass files
-    tests/            // Integration and Unit testing
-    utils/            // Helper functions
-    index.js
+GitHub Actions (.github/workflows/e2e.yml)        OpenShift
+├─ push to dev  ──▶ oc start-build range-web-e2e  ──▶ tools ns: BuildConfig → ImageStream
+│                   (Dockerfile.e2e, Playwright base image)
+├─ wait for the app under test to finish rolling out in dev
+└─ oc process openshift/deployments/e2e.yaml | oc create  ──▶ dev ns: Job
+      poll exit code → oc logs → retry once on SSO failure       ├─ e2e container: npx playwright test
+      → oc cp report/traces → upload-artifact → delete Job       └─ artifact-sync sidecar: keeps the
+                                                                     results volume alive for oc cp
 ```
 
-For the project to build, **these files must exist with exact filenames**:
+The tests run inside the cluster, so they can reach the dev database directly over the
+service network. The database is used to seed and clean up test data. GitHub Actions only
+orchestrates: it starts the Job, waits for it, and collects the results.
 
-- `public/index.html` is the page template;
-- `src/index.js` is the JavaScript entry point.
+## What's here
 
-## Environment variables
+| Path                             | Role                                                                                   |
+| -------------------------------- | -------------------------------------------------------------------------------------- |
+| `.github/workflows/e2e.yml`      | Orchestrates build → wait → run Job → collect artifacts                                |
+| `openshift/builds/e2e.yaml`      | ImageStream + BuildConfig for the test image                                           |
+| `openshift/deployments/e2e.yaml` | Job template: params, secrets, results volume, sidecar                                 |
+| `openshift/rbac/e2e.yaml`        | Least-privilege Roles for the GitHub Actions service account                           |
+| `Dockerfile.e2e`                 | Test image. Copies only the package files, `playwright.config.js` and `playwright/`    |
+| `playwright.config.js`           | Reads all `PLAYWRIGHT_*` settings from environment variables                           |
+| `playwright/e2e/`                | range-web's specs and support helpers, kept as worked examples (SSO login, DB seeding) |
+| `docs/e2e-openshift.md`          | range-web's setup runbook: build config, secrets, RBAC, GitHub secrets                 |
+
+Start with [`docs/e2e-openshift.md`](docs/e2e-openshift.md). It explains how to set up and
+run the pattern.
+
+## Things to change when copying it
+
+- Namespaces (`3187b2-*`), URLs, secret names and the database host are specific to MyRangeBC.
+- The `wait-for-dev-deploy` job polls range-web's own build and deployment
+  (`range-web`, `range-web-caddy`). Point it at your app.
+- The `@playwright/test` version must match the base image tag in `Dockerfile.e2e`.
+- The Job's `securityContext.fsGroup` is hardcoded. Use the template's `${FS_GROUP}` parameter
+  and set it to a value in your namespace's supplemental group range.
+
+## Running locally
 
 ```bash
-REACT_APP_SSO_REALM_NAME= # Realm name for SSo
-REACT_APP_SSO_CLIENT_ID= # Client ID for SSO
-REACT_APP_API_URL= # API URL. Hosted dev API is at https://web-range-myra-dev.pathfinder.gov.bc.ca/api.
+npm ci
+npm run test:e2e:verify   # install Chromium
+npx playwright test --list
 ```
-
-There are example environment variables in `.env.example` that you can copy into `.env`.
-
-## Available Scripts
-
-In the project directory, you can run:
-
-### `npm start`
-
-Runs the app in the development mode.
-Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
-
-### `npm test`
-
-Launches the test runner in the interactive watch mode.<br>
-
-### `npm test -- --coverage`
-
-Launches the test runner with a coverage report.<br>
-
-### `npm run build`
-
-Builds the app for production to the `build` folder.
-It correctly bundles React in production mode and optimizes the build for the best performance.<br><br>
-
-In `/semantic` directory, you can also run:
-
-## Running E2E tests with Playwright
-
-The E2E suite is configured for the Initial RUP approval workflow and requires DB-backed role switching plus SSO credentials for test users.
-
-### Commands
-
-```bash
-npm run test:e2e:verify
-npm run test:e2e:open
-npm run test:e2e:run
-npm run test:e2e:extension:harness
-```
-
-### Required Playwright environment variables
-
-```bash
-# App/API
-PLAYWRIGHT_BASE_URL=
-PLAYWRIGHT_API_BASE_URL=
-
-# SSO token endpoint auth
-PLAYWRIGHT_SSO_BASE_URL=
-PLAYWRIGHT_SSO_REALM_NAME=
-PLAYWRIGHT_SSO_CLIENT_ID=
-# optional if your realm client requires it
-PLAYWRIGHT_SSO_CLIENT_SECRET=
-# optional full token endpoint override (if base+realm does not apply)
-PLAYWRIGHT_SSO_TOKEN_URL=
-
-# Test users
-PLAYWRIGHT_AH_USERNAME=
-PLAYWRIGHT_AH_PASSWORD=
-PLAYWRIGHT_STAFF_USERNAME=
-PLAYWRIGHT_STAFF_PASSWORD=
-
-# optional role-specific SSO overrides when AH/staff differ
-# staff values apply to SA/DM logins
-PLAYWRIGHT_STAFF_SSO_BASE_URL=
-PLAYWRIGHT_STAFF_SSO_REALM_NAME=
-PLAYWRIGHT_STAFF_SSO_CLIENT_ID=
-PLAYWRIGHT_STAFF_SSO_CLIENT_SECRET=
-PLAYWRIGHT_STAFF_SSO_TOKEN_URL=
-
-PLAYWRIGHT_AH_SSO_BASE_URL=
-PLAYWRIGHT_AH_SSO_REALM_NAME=
-PLAYWRIGHT_AH_SSO_CLIENT_ID=
-PLAYWRIGHT_AH_SSO_CLIENT_SECRET=
-PLAYWRIGHT_AH_SSO_TOKEN_URL=
-
-# Role switching task (Postgres)
-PLAYWRIGHT_DB_HOST=
-PLAYWRIGHT_DB_PORT=
-PLAYWRIGHT_DB_NAME=
-PLAYWRIGHT_DB_USER=
-PLAYWRIGHT_DB_PASSWORD=
-# optional
-PLAYWRIGHT_DB_SSL=false
-
-# Optional DB setup override
-PLAYWRIGHT_TEST_DISTRICT_CODE=TST
-# Optional source agreement for deep plan seeding copy
-PLAYWRIGHT_SEED_SOURCE_AGREEMENT_ID=RAN099915
-
-```
-
-You can copy the template and fill values locally:
-
-```bash
-cp .env.playwright.example .env.playwright.local
-```
-
-### Workflow assumptions
-
-- E2E creates a new agreement/client/plan per scenario directly in DB (`RAN0999XX` agreement range), and copies plan content from `PLAYWRIGHT_SEED_SOURCE_AGREEMENT_ID` (default `RAN099915`).
-- Tests run with a single configured E2E user (`PLAYWRIGHT_E2E_USERNAME` / `PLAYWRIGHT_E2E_PASSWORD`).
-- Role switches for SA/AH/DM are applied by DB update on that user's `user_account.role_id` (resolved by `PLAYWRIGHT_E2E_SSO_ID` when provided, or inferred from username).
-- The seeded agreement is placed under a zone in district `PLAYWRIGHT_TEST_DISTRICT_CODE` (defaults to `TST`).
-- Role changes require logout/login before effective permissions are asserted.
-- The shared E2E user role is restored to SA (`role_id=3`) after each test.
-- Scenario failures persist artifacts in `playwright/artifacts/` and traces/videos/screenshots under Playwright outputs.
-
-### Refactor baseline
-
-- Refactor parity guardrails and baseline verification commands are documented in `playwright/e2e/BASELINE.md`.
-
-### Plan extension harness (ST-001)
-
-- `playwright/e2e/plan-extension-workflow.spec.ts` includes both harness readiness and extension workflow coverage:
-  - harness readiness checks (single-user mode, DB role switching for SA/AH/DM, role re-login/landing),
-  - business-flow scenarios PE-001 through PE-007,
-  - cross-role matrix validation for extension states and allowed actions.
-- Run directly with `npm run test:e2e:extension:harness`.
-
-### Plan extension seed utility (ST-002)
-
-- `playwright/e2e/support/planExtensionSeedRuntime.ts` provides deterministic setup for extension scenarios.
-- It reuses baseline deep-plan seeding from `playwright/e2e/support/dbRuntime.ts` and then applies extension-specific shaping:
-  - sets plan end date as `eligible` (within 1 year) or `ineligible` (beyond 1 year),
-  - ensures multi-client agreement coverage (adds at least one additional client by default),
-  - resets extension-related fields on the seeded plan.
-
-### `gulp build`
-
-Builds all files for Semantic UI including js, css, and assets. Build tool settings are stored in semantic.json.
-
-## Create React App
-
-The application was built on top of [Create-React-App](https://github.com/facebook/create-react-app) with [Redux selector pattern](https://github.com/markerikson/react-redux-links/blob/master/redux-reducers-selectors.md#selectors) for state management and [React Router v4](https://github.com/ReactTraining/react-router) for routing & code splitting. The project was ejected once to add more plugins and make changes in Webpack configuration, then it was switched back to the unejected state with the newer version since it took care of all the demands.
-
-## Routing & Code Splitting
-
-This project takes advantage of React Router v4 to acheive many things such as authentication, authorizing users based on their roles, code splitting, dynamic route matching and so on.
-
-Create React App allows us to dynamically import parts of our app using the `import()` proposal to reduce initial load time. Related reference can be found [here](https://serverless-stack.com/chapters/code-splitting-in-create-react-app.html).
-
-## Styling
-
-- [Semantic UI React](https://react.semantic-ui.com/usage) was chosen for the main css framework. It includes Gulp build tools so the project can preserve its own theme changes, allowing us to customise the style variables. Detailed documentation on theming in Semantic UI can be found [here](http://learnsemantic.com/developing/customizing.html).
-
-- [BEM(Block Element Modifier)](http://getbem.com/introduction) methodology was chosen for naming convention.
-
-- Integration with Sass
-
-- Post-Processing CSS
-
-  ```css
-  .App {
-    display: flex;
-  }
-  ```
-
-  becomes this:
-
-  ```css
-  .App {
-    display: -webkit-box;
-    display: -ms-flexbox;
-    display: flex;
-  }
-  ```
-
-## Openshift Deployment Cheatsheet
-
-- image-stream: range-myra-web
-- app build-config: range-myra-web-dev-build
-- outputs to: range-myra-web:latest
-
-- image-stream: range-myra-web-caddy
-- caddy build-config: range-myra-web-caddy-dev-build
-- input image stream tag: range-myra-web:latest
-- output image stream tag: range-myra-web-caddy:latest
-
-- deploy-config: range-myra-web-caddy
-- trigger: range-myra-web-caddy:test
-
-- [Github Action Openshift image build + tag](https://github.com/bcgov/range-web/blob/dev/.github/workflows/deploy-test.yml)
-  Make sure your SA can only build and tag!
 
 ## License
 
@@ -257,5 +83,3 @@ Create React App allows us to dynamically import parts of our app using the `imp
     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
     See the License for the specific language governing permissions and
     limitations under the License.
-
-<a rel="license" href="http://creativecommons.org/licenses/by/4.0/"><img alt="Creative Commons Licence" style="border-width:0" src="https://i.creativecommons.org/l/by/4.0/80x15.png" /></a><br /><span xmlns:dct="http://purl.org/dc/terms/" property="dct:title">range-web</span> by <span xmlns:cc="http://creativecommons.org/ns#" property="cc:attributionName">the Province of Britich Columbia</span> is licensed under a <a rel="license" href="http://creativecommons.org/licenses/by/4.0/">Creative Commons Attribution 4.0 International License</a>.
