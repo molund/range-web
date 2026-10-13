@@ -1,11 +1,13 @@
 kind: List
 apiVersion: v1
 items:
+  # Everything the workflow does happens in tools: start the image build, run the Job,
+  # read its logs, and oc cp the results out (pods/exec).
   - apiVersion: rbac.authorization.k8s.io/v1
     kind: Role
     metadata:
-      name: range-web-e2e
-      namespace: "3187b2-dev"
+      name: playwright-e2e-test-runner
+      namespace: "c1643c-tools"
     rules:
       - apiGroups: ["batch"]
         resources: ["jobs"]
@@ -19,28 +21,6 @@ items:
       - apiGroups: [""]
         resources: ["pods/exec"]
         verbs: ["create"]
-      - apiGroups: ["apps"]
-        resources: ["deployments"]
-        verbs: ["get", "list", "watch"]
-  - apiVersion: rbac.authorization.k8s.io/v1
-    kind: RoleBinding
-    metadata:
-      name: range-web-e2e
-      namespace: "3187b2-dev"
-    roleRef:
-      apiGroup: rbac.authorization.k8s.io
-      kind: Role
-      name: range-web-e2e
-    subjects:
-      - kind: ServiceAccount
-        name: github-cicd
-        namespace: 3187b2-tools
-  - apiVersion: rbac.authorization.k8s.io/v1
-    kind: Role
-    metadata:
-      name: range-web-e2e-read
-      namespace: "3187b2-tools"
-    rules:
       - apiGroups: ["build.openshift.io"]
         resources: ["buildconfigs", "builds"]
         verbs: ["get", "list", "watch"]
@@ -56,13 +36,13 @@ items:
   - apiVersion: rbac.authorization.k8s.io/v1
     kind: RoleBinding
     metadata:
-      name: range-web-e2e-read
-      namespace: "3187b2-tools"
+      name: playwright-e2e-test-runner
+      namespace: "c1643c-tools"
     roleRef:
       apiGroup: rbac.authorization.k8s.io
       kind: Role
-      name: range-web-e2e-read
+      name: playwright-e2e-test-runner
     subjects:
       - kind: ServiceAccount
-        name: github-cicd
-        namespace: 3187b2-tools
+        name: githubactions
+        namespace: c1643c-tools

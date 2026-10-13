@@ -1,106 +1,123 @@
 # E2E on OpenShift
 
-The Playwright suite in `playwright/e2e/` runs as a one-shot Kubernetes Job in the **dev** namespace (`3187b2-dev`), pointed at the already-deployed web/api/database. Nothing extra is deployed to run it.
-
-Dev topology (verify with `oc get all -n 3187b2-dev`):
-
-- **Web**: `deployment/range-web-caddy` (1 pod), service `myra-web` on port 2015
-- **API**: `deployment/range-api`, service `myra-api` on port 8080
-- **Routes**: `web` → `https://myrangebc-dev.apps.silver.devops.gov.bc.ca` and `api` (`/api` path) → `myra-api`
-- **Database**: Patroni cluster `range-pg17-dev`, accessed via service `range-pg17-dev-primary:5432`, database `myra`
-- **Deployment**: the web deployment follows the latest tools `range-web-caddy:latest` image
+The Playwright suite in `tests/e2e/` runs as a one-shot Kubernetes Job in the **tools** namespace (`c1643c-tools`). It reaches the site being tested only through its publicly accessible URLs, so one Job setup can test every environment. Nothing is deployed alongside the app.
 
 ## Architecture
 
 ```
-GitHub Actions (e2e.yml)                OpenShift
-├─ workflow_dispatch  ───────────────▶  ├─ 3187b2-tools
-│  (or push to dev + dev deploy ready)  │   └─ range-web-e2e ImageStream (Playwright image)
-│                                      └─ 3187b2-dev
-│                                         └─ Job range-web-e2e
-│                                            ├─ e2e container  — runs `npx playwright test --workers=1`
-│                                            └─ artifact-sync  — `sleep infinity`, holds report/traces
-└─ polls job → copies artifacts → cleans up job
+GitHub Actions (playwright-openshift.yaml)          OpenShift: c1643c-tools
+├─ Set target site (environment → BASE_URL/CMS_URL)
+├─ oc start-build --from-dir=tests/e2e ──────────▶  BuildConfig playwright-runner → image @sha256
+├─ oc process | oc create ───────────────────────▶  Job bcparks-e2e-<run id>-<attempt>
+├─ stream logs, wait for the exit code              ├─ e2e: npm run test:<browser> ──▶ public URL
+├─ oc cp report → upload-artifact                   └─ artifact-sync: sleep infinity, holds results
+└─ delete the Job
 ```
+
+Every run builds the image from the commit under test and pins the Job to that build's digest. Two runs at once (for example two PRs) get separate builds, Jobs and reports.
 
 ## One-time setup
 
-### 1. Build the e2e image (tools)
+### 1. Create the BuildConfig and ImageStream
 
 ```bash
-oc process -f openshift/builds/e2e.yaml -p SOURCE_REPOSITORY_URL=https://github.com/bcgov/range-web -p SOURCE_REPOSITORY_REF=dev | oc apply -f - -n 3187b2-tools
-oc start-build range-web-e2e -n 3187b2-tools
+oc process -f openshift/builds/e2e.yaml | oc apply -f - -n c1643c-tools
 ```
 
-The base image (`mcr.microsoft.com/playwright:v1.62.0-noble`) is pinned to the repo's `@playwright/test` version. If `@playwright/test` is bumped, bump the base image tag in `Dockerfile.e2e` too, or the browser executables won't match.
-
-### 2. Create the credentials secret (test)
+The BuildConfig has no triggers, so applying it doesn't start a build. The workflow starts one on every run. To build by hand from your checkout:
 
 ```bash
-grep -E '^(PLAYWRIGHT_E2E_USERNAME|PLAYWRIGHT_E2E_PASSWORD|PLAYWRIGHT_E2E_SSO_ID|PLAYWRIGHT_E2E_LOGIN_MODE|PLAYWRIGHT_SSO_CLIENT_SECRET)=' .env.playwright.local \
-  | sed -E 's/^PLAYWRIGHT_E2E_//; s/^PLAYWRIGHT_SSO_CLIENT_SECRET=/SSO_CLIENT_SECRET=/' \
-  > /tmp/e2e-credentials.env
-oc create secret generic e2e-credentials --from-env-file=/tmp/e2e-credentials.env -n 3187b2-dev
-rm /tmp/e2e-credentials.env
+oc start-build playwright-runner --from-dir=tests/e2e --follow -n c1643c-tools
 ```
 
-Required keys: `USERNAME`, `PASSWORD`, `SSO_ID`, `LOGIN_MODE`. `SSO_CLIENT_SECRET` is optional. DB credentials come from the existing `range-pg17-dev-pguser-app-prod-myra` secret (keys `user`/`password`) at runtime — override with `-p POSTGRES_SECRET=<name>` if you create a dedicated e2e DB user. Never commit credentials.
+`tests/e2e/.dockerignore` keeps local `env/.env.*` files (which can hold credentials) and `node_modules` out of the image.
 
-### 3. Grant the Actions ServiceAccount (RBAC)
+A plain `oc start-build playwright-runner`, without `--from-dir`, clones `bcgov/bcparks.ca` at `main` and builds `tests/e2e` from there.
+
+### 2. Grant the Actions ServiceAccount (RBAC)
 
 ```bash
 oc apply -f openshift/rbac/e2e.yaml
 ```
 
-The roles bind the `github-cicd` ServiceAccount in `3187b2-tools`, which backs `OPENSHIFT_TOKEN`. They grant Job/Pod management in `3187b2-dev` and build/ImageStream access in `3187b2-tools`.
+This binds the `githubactions` ServiceAccount in `c1643c-tools`, which backs `OPENSHIFT_TOKEN`, to a Role in the same namespace. The Role covers starting binary builds, reading builds and ImageStreams, managing Jobs, reading pods and logs, and `pods/exec` (which `oc cp` needs). Nothing is granted in dev, test or prod.
 
-### 4. Repo secrets (GitHub)
+### 3. Find the tools namespace's fsGroup
 
-Set `OPENSHIFT_SERVER` and `OPENSHIFT_TOKEN` on the repo. `OPENSHIFT_TOKEN` is the ServiceAccount token from step 3:
+The Job's results volume needs an `fsGroup` inside the namespace's allowed range, or OpenShift rejects the pod:
 
 ```bash
-secret=$(oc get sa github-cicd -n 3187b2-tools -o jsonpath='{.secrets[*].name}' | tr ' ' '\n' | grep -v dockercfg | head -1)
-oc get secret "$secret" -n 3187b2-tools -o jsonpath='{.data.token}' | base64 -d
+oc describe ns c1643c-tools | grep supplemental-groups
+# openshift.io/sa.scc.supplemental-groups=1001230000/10000  → use 1001230000
+```
+
+### 4. GitHub secrets and variables
+
+| Name                           | Kind     | Value                                        |
+| ------------------------------ | -------- | -------------------------------------------- |
+| `OPENSHIFT_SERVER`             | secret   | Gold API server URL                          |
+| `OPENSHIFT_TOKEN`              | secret   | `githubactions` ServiceAccount token (below) |
+| `OPENSHIFT_GOLD_LICENSE_PLATE` | secret   | `c1643c` (bcparks.ca already has this one)   |
+| `E2E_FS_GROUP`                 | variable | The number from step 3                       |
+
+```bash
+secret=$(oc get sa githubactions -n c1643c-tools -o jsonpath='{.secrets[*].name}' | tr ' ' '\n' | grep -v dockercfg | head -1)
+oc get secret "$secret" -n c1643c-tools -o jsonpath='{.data.token}' | base64 -d
 ```
 
 ## Manual run (oc)
 
 ```bash
-oc process -f openshift/deployments/e2e.yaml -n 3187b2-dev \
-  -p PLAYWRIGHT_BASE_URL="https://myrangebc-dev.apps.silver.devops.gov.bc.ca" \
-  -p PLAYWRIGHT_API_BASE_URL="https://myrangebc-dev.apps.silver.devops.gov.bc.ca/api" \
-  -p PLAYWRIGHT_TEST_SPEC="playwright/e2e/plan-extension-workflow.spec.ts" \
-  | oc create -f - -n 3187b2-dev
+build=$(oc start-build playwright-runner --from-dir=tests/e2e -o name -n c1643c-tools)
+oc logs -f "$build" -n c1643c-tools
+digest=$(oc get "$build" -n c1643c-tools -o jsonpath='{.status.output.to.imageDigest}')
+
+oc process -f openshift/deployments/e2e.yaml \
+  -p JOB_NAME=bcparks-e2e-manual \
+  -p E2E_IMAGE="image-registry.openshift-image-registry.svc:5000/c1643c-tools/playwright-runner@$digest" \
+  -p ENV=dev \
+  -p BASE_URL=https://main-public-c1643c-dev.apps.gold.devops.gov.bc.ca/ \
+  -p CMS_URL=https://dev-cms.bcparks.ca/ \
+  -p SUITE=full-chromium \
+  -p FS_GROUP=<number from step 3> \
+  | oc create -f - -n c1643c-tools
 ```
 
 Watch the suite, then read the result:
 
 ```bash
-oc logs -c e2e job/range-web-e2e -n 3187b2-dev -f
-pod=$(oc get pods -l job-name=range-web-e2e -n 3187b2-dev -o jsonpath='{.items[0].metadata.name}')
-oc get pod "$pod" -n 3187b2-dev -o jsonpath='{.status.containerStatuses[?(@.name=="e2e")].state.terminated.exitCode}'
-oc cp "$pod:/e2e/results/report/." ./playwright-report -c artifact-sync -n 3187b2-dev
-oc cp "$pod:/e2e/results/artifacts/." ./playwright-artifacts -c artifact-sync -n 3187b2-dev
-oc delete job range-web-e2e -n 3187b2-dev
+pod=$(oc get pods -l job-name=bcparks-e2e-manual -n c1643c-tools -o jsonpath='{.items[0].metadata.name}')
+oc logs -f "$pod" -c e2e -n c1643c-tools
+oc get pod "$pod" -n c1643c-tools -o jsonpath='{.status.containerStatuses[?(@.name=="e2e")].state.terminated.exitCode}'
+oc cp "$pod:/e2e/results/report/." ./playwright-report -c artifact-sync -n c1643c-tools
+oc cp "$pod:/e2e/results/artifacts/." ./test-results -c artifact-sync -n c1643c-tools
+oc delete job bcparks-e2e-manual -n c1643c-tools
 ```
 
-The main container's exit code is the suite result (0 = green). The `artifact-sync` sidecar keeps the shared volume alive so report/traces can be copied out, then you delete the Job.
+The `e2e` container's exit code is the suite result (0 = green). The `artifact-sync` sidecar keeps the shared volume alive so the report can be copied out, then you delete the Job.
 
 ## GitHub Actions
 
-`.github/workflows/e2e.yml`:
+`.github/workflows/playwright-openshift.yaml` has the same interface as bcparks.ca's `playwright.yaml`:
 
-- **`workflow_dispatch`** — run immediately against whatever is currently deployed in dev. Pass `base_url`/`api_base_url` to override the defaults. Optional `test_spec` runs a specific Playwright spec path (for example `playwright/e2e/plan-extension-workflow.spec.ts`).
-- **`push` to `dev`** — immediately builds `range-web-e2e:latest` from the pushed revision. In parallel, the workflow waits for the tools build and then for the dev `range-web-caddy` deployment to update to that latest image and roll out. It runs the suite only after the dev deployment is ready.
-- **e2e image build** — every push-triggered run creates a binary OpenShift build from the pushed revision. Manual runs reuse `range-web-e2e:latest` and fail fast if it does not exist.
+- **`pull_request`** to `main` or `alpha`, when `tests/e2e/**`, `openshift/**` or the workflow changes. PRs run `full-chromium` against prod (PRs to `main`) or alpha-test (PRs to `alpha`). PRs from forks are skipped, because they don't get the secrets. A new push to the same PR cancels the previous run.
+- **`workflow_dispatch`** with `environment` (prod, test, dev, alpha-test, alpha-dev) and `suite` (full-chromium, full-firefox, full-webkit, content-check). Manual runs never cancel each other.
 
-The suite's exit code decides the workflow result. Logs, the HTML report, and traces are uploaded as the `e2e-report` artifact.
+The suite's exit code decides the workflow result. The HTML report and test results are uploaded as the `playwright-report` artifact.
+
+## How the Job runs the tests
+
+The Job sets `CI=true`, `ENV`, `BASE_URL`, `CMS_URL` and `SUITE`, then runs `npm run test:<browser>` (or `npm run test:content-check`), the same scripts as on a GitHub runner. bcparks.ca's `playwright.config.js` doesn't need changes:
+
+- `PLAYWRIGHT_HTML_OUTPUT_DIR=/e2e/results/report` moves the HTML report onto the shared volume.
+- `--output=/e2e/results/artifacts` does the same for traces and screenshots.
+- `BASE_URL` comes from the environment, so `env/.env.<ENV>` isn't needed in the image.
 
 ## Troubleshooting
 
-- **Chromium sandbox error** — the Job sets `PLAYWRIGHT_NO_SANDBOX=1`; verify the image/config picked it up (`oc get istag range-web-e2e:latest`).
-- **DB connection refused / SSL error** — the Job targets `range-pg17-dev-primary:5432` with `PLAYWRIGHT_DB_SSL=true`. If the Patroni server does not enforce TLS, run the Job with `-p DB_SSL=false`.
-- **Login fails** — confirm the e2e user exists in the target DB and the SSO client has the test web origin registered as a redirect URI.
-- **API calls fail** — the API base URL must match what the deployed web uses (`${origin}/api` in the bundled app). Confirm with `oc get routes -n 3187b2-dev`.
-- **Job stuck** — the suite timeouts are generous; if it never exits, delete the Job and inspect the logs.
-- **Concurrency** — the suite seeds/cleans `E2E-AUTO` agreements in the shared test DB. Don't run the Job while another e2e run is in progress.
+- **Pod rejected / `fsGroup` not allowed:** `E2E_FS_GROUP` isn't in the tools namespace's range (setup step 3).
+- **Build fails pulling the base image:** check that the Playwright tag in `openshift/builds/e2e.yaml` exists and matches `@playwright/test`.
+- **Chromium fails to launch:** Playwright launches Chromium without its sandbox by default, which is what OpenShift's restricted pods need. Check that nothing in the config sets `chromiumSandbox: true`, and look at the `e2e` container's logs for the launch error.
+- **Can't reach the site:** check that the tools namespace allows egress, and test from a debug pod: `oc run curl --rm -it --image=curlimages/curl -n c1643c-tools -- curl -I <url>`. For prod, the vanity route's `ip_whitelist` may not include the cluster's egress IP.
+- **Job left behind:** a cancelled run can't delete its Job. The `artifact-sync` sidecar keeps the pod running, so the Job only ends at its 1-hour `activeDeadlineSeconds`, and `ttlSecondsAfterFinished` deletes it an hour after that. To clean up sooner: `oc delete jobs -l app=bcparks-e2e -n c1643c-tools`.
+- **Out of quota:** each run requests 500m CPU / 1Gi for the tests, plus the build. Many PRs at once can exceed the tools quota. Builds queue (`runPolicy: Serial`), but Jobs don't.

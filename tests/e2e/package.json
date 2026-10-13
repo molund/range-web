@@ -1,0 +1,23 @@
+{
+  "name": "bcparks-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Placeholder Playwright suite shaped like bcparks.ca's tests/e2e",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "playwright test --project=full-chromium --project=full-firefox --project=full-webkit",
+    "test:chromium": "playwright test --project=full-chromium",
+    "test:firefox": "playwright test --project=full-firefox",
+    "test:webkit": "playwright test --project=full-webkit",
+    "test:content-check": "playwright test --project=strapi-gatsby-comparison"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  }
+}

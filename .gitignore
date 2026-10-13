@@ -1,13 +1,2 @@
 node_modules
 .DS_Store
-
-# local credentials
-.env
-.env.playwright
-.env.playwright.local
-
-# Playwright output
-playwright-report
-test-results
-playwright/artifacts
-playwright/.auth

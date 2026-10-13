@@ -21,51 +21,67 @@ Thank you to the range-web team for doing the hard work in the open.
 ## The pattern in one picture
 
 ```
-GitHub Actions (.github/workflows/e2e.yml)        OpenShift
-├─ push to dev  ──▶ oc start-build range-web-e2e  ──▶ tools ns: BuildConfig → ImageStream
-│                   (Dockerfile.e2e, Playwright base image)
-├─ wait for the app under test to finish rolling out in dev
-└─ oc process openshift/deployments/e2e.yaml | oc create  ──▶ dev ns: Job
-      poll exit code → oc logs → retry once on SSO failure       ├─ e2e container: npx playwright test
-      → oc cp report/traces → upload-artifact → delete Job       └─ artifact-sync sidecar: keeps the
-                                                                     results volume alive for oc cp
+GitHub Actions (playwright-openshift.yaml)          OpenShift: c1643c-tools
+├─ oc start-build --from-dir=tests/e2e ──────────▶  BuildConfig playwright-runner → image @sha256
+├─ oc process openshift/deployments/e2e.yaml ────▶  Job bcparks-e2e-<run id>
+│     | oc create                                    ├─ e2e: npm run test:<browser>
+├─ stream logs, wait for the exit code                │     ──▶ https://bcparks.ca/ (or a Gold route)
+├─ oc cp report → upload-artifact                    └─ artifact-sync: keeps the results volume
+└─ delete the Job                                        alive for oc cp
 ```
 
-The tests run inside the cluster, so they can reach the dev database directly over the
-service network. The database is used to seed and clean up test data. GitHub Actions only
-orchestrates: it starts the Job, waits for it, and collects the results.
+The GitHub runner never talks to bcparks.ca. It builds the test image from the commit under test,
+starts a Job in the tools namespace, and collects the report. The test traffic comes from inside
+the cluster.
+
+The workflow has the same interface as bcparks.ca's current `playwright.yaml`: the same
+`environment` and `suite` inputs, the same URL logic and the same PR trigger. It's meant to run
+alongside it until the in-cluster runs prove they get past the block.
+
+**Changes from upstream:** range-web ran the Job in its dev namespace after each deploy, with SSO
+login and direct Postgres access for seeding test data. Here the Job runs in tools against public
+URLs only. Each run gets its own Job name and an image pinned by digest, so PRs don't collide.
+The suite is a placeholder shaped like bcparks.ca's `tests/e2e`. range-web's original suite is in
+[upstream's history](https://github.com/bcgov/range-web/tree/dev/playwright/e2e).
 
 ## What's here
 
-| Path                             | Role                                                                                   |
-| -------------------------------- | -------------------------------------------------------------------------------------- |
-| `.github/workflows/e2e.yml`      | Orchestrates build → wait → run Job → collect artifacts                                |
-| `openshift/builds/e2e.yaml`      | ImageStream + BuildConfig for the test image                                           |
-| `openshift/deployments/e2e.yaml` | Job template: params, secrets, results volume, sidecar                                 |
-| `openshift/rbac/e2e.yaml`        | Least-privilege Roles for the GitHub Actions service account                           |
-| `Dockerfile.e2e`                 | Test image. Copies only the package files, `playwright.config.js` and `playwright/`    |
-| `playwright.config.js`           | Reads all `PLAYWRIGHT_*` settings from environment variables                           |
-| `playwright/e2e/`                | range-web's specs and support helpers, kept as worked examples (SSO login, DB seeding) |
-| `docs/e2e-openshift.md`          | range-web's setup runbook: build config, secrets, RBAC, GitHub secrets                 |
+| Path                                          | Role                                                               |
+| --------------------------------------------- | ------------------------------------------------------------------ |
+| `.github/workflows/playwright-openshift.yaml` | Build image → run Job → collect report → delete Job                |
+| `openshift/builds/e2e.yaml`                   | ImageStream + BuildConfig for the test image (no triggers)         |
+| `openshift/deployments/e2e.yaml`              | Job template: suite, URLs, fsGroup, results volume, sidecar        |
+| `openshift/rbac/e2e.yaml`                     | Least-privilege Role for the GitHub Actions service account        |
+| `tests/e2e/Dockerfile.e2e`, `.dockerignore`   | Test image on the Playwright base image (all browsers included)    |
+| `tests/e2e/` (rest)                           | Placeholder suite with bcparks.ca's scripts, projects and env vars |
+| `docs/e2e-openshift.md`                       | Setup runbook: build config, RBAC, fsGroup, secrets and variables  |
 
-Start with [`docs/e2e-openshift.md`](docs/e2e-openshift.md). It explains how to set up and
-run the pattern.
+Start with [`docs/e2e-openshift.md`](docs/e2e-openshift.md).
 
-## Things to change when copying it
+## Copying it into bcparks.ca
 
-- Namespaces (`3187b2-*`), URLs, secret names and the database host are specific to MyRangeBC.
-- The `wait-for-dev-deploy` job polls range-web's own build and deployment
-  (`range-web`, `range-web-caddy`). Point it at your app.
-- The `@playwright/test` version must match the base image tag in `Dockerfile.e2e`.
-- The Job's `securityContext.fsGroup` is hardcoded. Use the template's `${FS_GROUP}` parameter
-  and set it to a value in your namespace's supplemental group range.
+1. Copy `tests/e2e/Dockerfile.e2e` and `tests/e2e/.dockerignore` into bcparks.ca's `tests/e2e/`.
+   Keep the rest of bcparks.ca's `tests/e2e` as it is: the placeholder suite here has the same
+   interface.
+2. Copy `openshift/` to wherever it fits, for example `infrastructure/e2e/`. Update the
+   `oc process -f` path and the `pull_request` paths filter in the workflow to match.
+3. Copy `.github/workflows/playwright-openshift.yaml`.
+4. Do the one-time setup in `docs/e2e-openshift.md`.
+
+Keep the Playwright version in sync in three places: `@playwright/test` in `package.json`, the
+`FROM` line in `Dockerfile.e2e`, and the base image in `openshift/builds/e2e.yaml`.
+
+**Risk to check first:** prod uses the `bcparks.ca` vanity route, which has an `ip_whitelist`.
+Requests from a pod may come from a cluster egress IP that isn't on the list. The non-prod Gold
+routes have no whitelist, so run `environment=dev` first, then `prod`.
 
 ## Running locally
 
 ```bash
+cd tests/e2e
 npm ci
-npm run test:e2e:verify   # install Chromium
-npx playwright test --list
+npx playwright install chromium
+BASE_URL=https://main-public-c1643c-dev.apps.gold.devops.gov.bc.ca/ npm run test:chromium
 ```
 
 ## License
